@@ -1,0 +1,40 @@
+{
+  "_generated": {
+    "system": "package-json@1.0.0",
+    "status": "generated",
+    "edit": "edit src/ \u2014 dependencies and exports derive from imports; everything else preserved"
+  },
+  "name": "@teamscala/cli-session-capture",
+  "type": "module",
+  "version": "0.0.8",
+  "sideEffects": false,
+  "imports": {
+    "#cli-session-capture/*": "./src/*",
+    "#cli-session-capture/*.ts": "./src/*.ts"
+  },
+  "files": [
+    "src"
+  ],
+  "dependencies": {},
+  "devDependencies": {
+    "bun-types": "1.4.2",
+    "@happy-dom/global-registrator": "20.14.5",
+    "@testing-library/react": "16.3.3"
+  },
+  "exports": {
+    "./cli-session-capture": {
+      "types": "./src/cli-session-capture.d.ts",
+      "default": "./src/cli-session-capture.ts"
+    },
+    "./cli-session-capture.ts": {
+      "types": "./src/cli-session-capture.d.ts",
+      "default": "./src/cli-session-capture.ts"
+    }
+  },
+  "repository": "https://github.com/teamgbg/bun-utilities-cli-session-capture",
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org"
+  },
+  "capability": "Per-CLI session-id capture adapters \u2014 watches JSONL, SQLite, and rollout directories for freshly launched CLI session identifiers.",
+  "tier": "utilities"
+}

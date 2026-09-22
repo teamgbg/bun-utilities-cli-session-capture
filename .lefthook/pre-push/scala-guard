@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+# @system codegen
+# @status generated
+# @edit change codegen_output 'repo-lefthook-prepush-script' transform, then regenerate
+#
+# pre-push transport for the scala-guard daemon. Emitted by
+# repo-lefthook-prepush-script@1.0.0; referenced by repo-lefthook-config@2.0.0
+# as a lefthook SCRIPT (not a command) so it fires UNCONDITIONALLY — including
+# a tag-only publish push (commit already pushed, then git tag + push
+# --follow-tags), where a lefthook COMMAND is skipped ('no matching push
+# files'). ONE curl to the daemon (single-call-per-hook-trigger); the daemon
+# runs every active pre-push guard_rule in one in-process pass. CHECKS ONLY
+# — no action runs inside this request (operator ruling 2026-08-22).
+
+# Master-switch self-check (mirrors the v1 command's skip clause). Exit 0
+# (allow) when pre-push is off — read the tmpfs cache first, fall back to the
+# authoritative DB read on cache miss.
+cache="${XDG_RUNTIME_DIR:-/tmp}/scala-guard-switch-state"
+if [ -f "$cache" ]; then
+  value="$(cat "$cache")"
+  if [ "$value" = "off" ] || grep -qx "pre-push=0" <<<"$value"; then
+    exit 0
+  fi
+else
+  # Cache absence is the only reason to cross the process boundary. An
+  # enabled cache value is already the supervisor-projected DB fact; reading
+  # the DB again puts queue latency on every push.
+  scala-tools master-switch is-off pre-push && exit 0
+fi
+# On cache miss, `is-off` is a
+# READ-ONLY predicate: exit 0 when the stage is off, 1 when it is on. It
+# used to call `stage-off`, which is an IMPERATIVE that TURNS THE STAGE OFF
+# and returns success — so every push disabled pre-push enforcement and then
+# skipped itself on the strength of its own side effect (measured 2026-08-08:
+# publish-chain never ran, so green pushes published nothing).
+# (skip) iff pre-push is off.
+
+# Resolve the repo root.
+repo_root="${LEFTHOOK_REPO_ROOT:-$(git rev-parse --show-toplevel 2>/dev/null)}"
+# Resolve the pushed file set from the local remote-tracking ref. Git push
+# performs authoritative remote negotiation immediately after this hook; a
+# second ls-remote duplicated that network round-trip inside the push
+# (measured 2026-08-10: hook 14.83s, push killed at 21.27s). Missing
+# identity fails loudly.
+upstream_base=$(git -C "$repo_root" rev-parse @{upstream} 2>/dev/null) || upstream_base=
+# THE CAPTURE GUARD above is load-bearing: on failure rev-parse ECHOES the
+# offending argument to STDOUT (the fatal: line is stderr), so an unguarded
+# capture holds the literal string '@{upstream}' — non-empty, so the
+# missing-identity branch is skipped and the flow dies later at merge-base
+# with a fault that names the wrong remedy (measured 2026-09-14:
+# bun-foundation-circuit-breaker's first push). A test stub that models a
+# rev-parse failure as clean-empty never reaches this trap; it must echo
+# the argument and fail, the way git does.
+# FIRST PUSH ON AN EMPTY REMOTE. No tracking ref can exist before any push
+# has landed, so a missing @{upstream} is a fault ONLY when the remote
+# actually holds refs. The remote is OBSERVED, not assumed: ls-remote must
+# SUCCEED, and its emptiness (repo-init bootstrap, repo-split first land —
+# measured 2026-09-14: bun-foundation-circuit-breaker was unpromotable)
+# makes the push's scope everything the branch carries (the empty tree).
+# A ls-remote that ERRORS is never evidence of emptiness: fault, never a
+# whole-tree scan of a remote we could not see.
+if [ -z "$upstream_base" ]; then
+  remote_refs=$(git -C "$repo_root" ls-remote origin 2>/dev/null)
+  if [ -n "$remote_refs" ]; then
+    printf 'push mechanism fault: no upstream tracking ref; configure the branch before pushing\n' >&2
+    exit 1
+  fi
+  merge_base="$(git -C "$repo_root" hash-object -t tree /dev/null)"
+else
+  # THE PUSH'S OWN COMMITS, NOT THE UPSTREAM TREE. `git diff @{upstream}..HEAD`
+  # includes the REVERSE of remote-only commits when the tracking ref is not
+  # an ancestor of HEAD (the remote advanced with commits this branch lacks):
+  # files the remote deleted appear as NEW additions, and their pre-existing
+  # violations block a push that never touched them (measured 2026-09-08:
+  # scala-core blocked on api-namecheap.ts, deleted by a remote-only commit).
+  # The merge-base diff is exactly the commits this push carries.
+  merge_base=$(git -C "$repo_root" merge-base "${upstream_base}" HEAD 2>/dev/null)
+fi
+if [ -z "$merge_base" ]; then
+  printf 'push mechanism fault: no merge base with upstream; configure the branch before pushing\n' >&2
+  exit 1
+fi
+# no_diff: a POSITIVE signal that the diff was resolved AND is empty
+# (merge_base==HEAD, a genuine tag-only publish push), NOT an unresolved
+# failure. The daemon uses it to skip the ~507 code guards that would
+# otherwise each full-scan an empty diff for nothing (iteration-speed-
+# budget: a no-diff push answers in ~3s). Resolution failure has already
+# failed loudly above. Publishing itself is NOT here — the push wrapper
+# dispatches it after the refs land (operator ruling 2026-08-22).
+no_diff=false
+pushed=$(git -C "$repo_root" diff --name-only "${merge_base}..HEAD" 2>/dev/null)
+[ -z "$pushed" ] && no_diff=true
+repo_name=$(basename "$repo_root")
+workspace_root=$(dirname "$repo_root")
+arr=$(echo "$pushed" | sed '/^$/d' | sed "s#^#${repo_name}/#" | sed 's/.*/"&"/' | paste -sd, -)
+payload="{\"staged_files\":[${arr}],\"cwd\":\"${repo_root}\",\"workspaceRoot\":\"${workspace_root}\",\"no_diff\":${no_diff}}"
+# NO WALL CLOCK (operator ruling 2026-09-03): the curl carries no wall-clock
+# ceiling — the push lands when the verdict lands, however long the gate takes.
+# A dead daemon faults fast via the 3s connect bound — but a WEDGED one does
+# not, and that is the case this bound exists for. A daemon that ACCEPTS the
+# connection and never answers passes the connect check and then holds the
+# push open forever; the connect bound is a claim about reachability, never
+# about liveness.
+#
+# MEASURED 2026-09-19: the container had no /run/scala/push directory, so the
+# guard's create_dir_all failed under /run, it sat in a 2s
+# `wake bind failed: Permission denied` retry loop, never loaded its
+# catalogue, and answered nothing while still accepting connections. The same
+# request measured http=000 after 20,038ms wedged, 18ms once the daemon was
+# stopped, and http=200 in 207ms once the directory existed. Pushes took ten
+# minutes; commits burned their whole 180s pre-commit budget. Nothing was
+# broken in a way any of those signals named.
+#
+# SO THE RESPONSE IS BOUNDED TOO, and by the same number the pre-commit arm
+# already uses, because the two arms ask one daemon one kind of question. A
+# push that cannot verify enforcement is still REFUSED (infrastructure
+# outranks app durability) — the bound decides how long that refusal takes,
+# never whether it happens. Publishing runs OUTSIDE the push: the wrapper writes the
+# refs, the tag landing emits, the publisher records its outcome durably
+# where the operator and the next push can read it.
+result="$(printf '%s' "$payload" | curl -s --connect-timeout 3 --max-time "${PRE_PUSH_VERDICT_BUDGET_SECONDS:-180}" -X POST "http://127.0.0.1:3109/hook/pre-push" -H 'Content-Type: application/json' --data-binary @- 2>&1)"
+curl_exit=$?
+if [ $curl_exit -ne 0 ] || [ -z "$result" ]; then
+  # A push whose enforcement transport is unreachable or empty has not
+  # verified its safety. Fail loudly and name the mechanism; treating this
+  # as success is the drift class this refusal exists to remove.
+  scala-tools guard hook-miss pre-push --repo "${repo_root}" --reason "curl_exit=${curl_exit}" >/dev/null 2>&1 || true
+  # NAME THE MECHANISM THAT ACTUALLY FAILED. Measured 2026-08-26/27: a push
+  # failed with curl exit 7 in 0.03 SECONDS — connection refused, because the
+  # guard daemon was mid-restart and enforcement never began — and was
+  # reported as a deadline overrun. The reader then hunts a latency problem
+  # that does not exist, which is the failure `friction-is-a-stop-condition`
+  # names: a block that does not point at the right path has moved the
+  # friction rather than removed it. A refusal and a connect timeout are
+  # different faults and must not share a sentence.
+  case "$curl_exit" in
+    7) fault='the guard daemon refused the connection, so enforcement never ran — it is down or restarting. Check the guard daemon with `scala-tools supervisor list`; a restart window clears on its own and the push is safe to retry' ;;
+    28) fault='the guard daemon did not accept the connection within 3s, so enforcement never began — it is down, wedged, or restarting. Check it with `scala-tools supervisor list`, then re-run the push' ;;
+    0) fault='the guard accepted the request and returned an empty body, so nothing was verified' ;;
+    *) fault="the enforcement transport failed (exit $curl_exit) — the transport said: ${result:-<no output>}" ;;
+  esac
+  printf 'push mechanism fault: %s\n' "$fault" >&2
+  exit 1
+fi
+if printf '%s\n' "$result" | grep -q '"decision":"block"'; then
+  printf '%s\n' "$result" >&2
+  exit 1
+fi
+if ! printf '%s\n' "$result" | grep -q '"decision"'; then
+  # A 2xx body that names no decision carries NO verdict: an evaluation
+  # whose result nobody received is indistinguishable from no evaluation
+  # (measured 2026-09-01: a 2-byte {} clean-run allow passed the emptiness
+  # check above and allowed a push nobody had verified). The daemon
+  # attaches an explicit decision to every enforcing pre-push response;
+  # a body without one is a transport fault, not an allow.
+  scala-tools guard hook-miss pre-push --repo "${repo_root}" --reason "decisionless_body" >/dev/null 2>&1 || true
+  printf 'push mechanism fault: the guard returned a body with no decision, so no verdict was delivered — the push is safe to retry once the guard path is fixed\n' >&2
+  exit 1
+fi
+exit 0
